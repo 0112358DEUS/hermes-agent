@@ -11049,6 +11049,15 @@ def mount_spa(application: FastAPI):
     and the SPA's runtime ``__HERMES_BASE_PATH__`` honour that prefix
     without rebuilding the bundle.
     """
+    # --- DEUS PWA overlay — keep additive for upstream merges ---------------
+    # Registers /deus-sw.js (Service-Worker-Allowed:/ + no-store) and
+    # /manifest.webmanifest ahead of the SPA catch-all. All PWA logic lives
+    # in hermes_cli/deus_pwa.py; this call + the head-injection line below
+    # are the only touches to this file.
+    from hermes_cli.deus_pwa import deus_pwa_head_html, deus_register_pwa_routes
+    deus_register_pwa_routes(application)
+    # -------------------------------------------------------------------------
+
     if not WEB_DIST.exists():
         @application.get("/{full_path:path}")
         async def no_frontend(full_path: str):
@@ -11101,6 +11110,9 @@ def mount_spa(application: FastAPI):
             html = html.replace('href="/fonts/', f'href="{prefix}/fonts/')
             html = html.replace('href="/ds-assets/', f'href="{prefix}/ds-assets/')
             html = html.replace('src="/ds-assets/', f'src="{prefix}/ds-assets/')
+        # DEUS PWA overlay — keep additive for upstream merges (manifest +
+        # iOS meta + isSecureContext-gated service-worker registration).
+        bootstrap_script += deus_pwa_head_html(prefix)
         html = html.replace("</head>", f"{bootstrap_script}</head>", 1)
         return HTMLResponse(
             html,

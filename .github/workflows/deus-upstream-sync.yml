@@ -1,0 +1,215 @@
+# DEUS overlay — keep additive for upstream merges.
+#
+# Weekly upstream sync for the 0112358deus/hermes-agent fork:
+#   1. fetches https://github.com/NousResearch/hermes-agent (upstream default branch),
+#   2. merges it into a sync branch cut from this fork's default branch,
+#   3. force-pushes the sync branch and opens/updates a PR to the default branch,
+#   4. runs the repo's cheapest meaningful test suite (the e2e job from
+#      tests.yml: `pytest tests/e2e/`, ~15 min budget) as the PR gate —
+#      pushes made with GITHUB_TOKEN do not trigger the fork's own
+#      pull_request workflows, so this run IS the gate.
+#
+# On merge conflict: the sync branch is reset to the upstream head so the PR
+# shows the incoming changes and GitHub flags the conflicting files; the PR
+# body states that a human must resolve the conflict. Tests are skipped in
+# that case (the tree is upstream's, not the merged result).
+#
+# No automerge — the PR is only labeled `upstream-sync` for triage.
+# Plain git + GitHub REST API via GITHUB_TOKEN (no gh CLI, no marketplace
+# sync action).
+
+name: Deus upstream sync
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC — off the top-of-hour rush
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the sync branch
+  pull-requests: write # open/update + label the PR
+
+concurrency:
+  group: deus-upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/NousResearch/hermes-agent
+  SYNC_BRANCH: deus/upstream-sync
+  SYNC_LABEL: upstream-sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout fork default branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0 # full history — required for a real merge
+
+      - name: Fetch upstream and merge into sync branch
+        id: merge
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          DEFAULT_BRANCH="$(curl -sSf \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}" | jq -r .default_branch)"
+          echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+
+          git remote add upstream "$UPSTREAM_URL"
+          # No --tags: a fork-local tag that clashes with an upstream tag
+          # would make the fetch fail under `set -e`. Branches are enough.
+          git fetch upstream
+
+          UPSTREAM_BRANCH="$(git ls-remote --symref "$UPSTREAM_URL" HEAD \
+            | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}')"
+          echo "upstream_branch=${UPSTREAM_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "Upstream default branch: ${UPSTREAM_BRANCH}"
+
+          git checkout -B "$SYNC_BRANCH" "origin/${DEFAULT_BRANCH}"
+
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "Fork already contains upstream/${UPSTREAM_BRANCH} — nothing to sync."
+            echo "status=up-to-date" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge --no-edit --no-ff "upstream/${UPSTREAM_BRANCH}" \
+              -m "Merge upstream ${UPSTREAM_BRANCH} (NousResearch/hermes-agent) into ${DEFAULT_BRANCH}"; then
+            echo "Clean merge."
+            echo "status=merged" >> "$GITHUB_OUTPUT"
+          else
+            echo "Merge conflict — resetting sync branch to upstream head so the"
+            echo "PR shows the incoming changes and GitHub flags the conflicts."
+            git merge --abort
+            git reset --hard "upstream/${UPSTREAM_BRANCH}"
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+          git push --force origin "$SYNC_BRANCH"
+
+      # ------------------------------------------------------------------ #
+      # PR gate: cheapest meaningful suite, mirroring tests.yml's e2e job.  #
+      # Only meaningful on a clean merge — a conflicted branch is upstream's #
+      # tree verbatim, so testing it says nothing about the merge result.   #
+      # ------------------------------------------------------------------ #
+      - name: Install ripgrep (test dependency)
+        if: steps.merge.outputs.status == 'merged'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+
+      - name: Install uv
+        if: steps.merge.outputs.status == 'merged'
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install dependencies
+        if: steps.merge.outputs.status == 'merged'
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Run e2e test suite (PR gate)
+        if: steps.merge.outputs.status == 'merged'
+        id: tests
+        continue-on-error: true # PR must still open/update on red — gate fails the run at the end
+        env:
+          # Ensure tests don't accidentally call real APIs
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/e2e/ -v --tb=short
+
+      - name: Open or update sync PR
+        if: steps.merge.outputs.status == 'merged' || steps.merge.outputs.status == 'conflict'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_STATUS: ${{ steps.merge.outputs.status }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          DEFAULT_BRANCH: ${{ steps.merge.outputs.default_branch }}
+          UPSTREAM_BRANCH: ${{ steps.merge.outputs.upstream_branch }}
+        run: |
+          set -euo pipefail
+
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json")
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          if [ "$MERGE_STATUS" = "conflict" ]; then
+            TITLE="Deus upstream sync: MERGE CONFLICT — human needed"
+            BODY=$(printf '%s\n' \
+              "## Upstream sync — merge conflict" \
+              "" \
+              "Merging \`upstream/${UPSTREAM_BRANCH}\` (NousResearch/hermes-agent) into \`${DEFAULT_BRANCH}\` hit a **merge conflict that needs a human to resolve**." \
+              "" \
+              "This branch was reset to the upstream head so GitHub flags the conflicting files below. Resolve locally:" \
+              "" \
+              '```' \
+              "git fetch origin ${SYNC_BRANCH}" \
+              "git checkout ${DEFAULT_BRANCH} && git merge origin/${SYNC_BRANCH}" \
+              "# fix conflicts, commit, push to ${SYNC_BRANCH}" \
+              '```' \
+              "" \
+              "Tests were **skipped** (the branch is upstream's tree verbatim, not a merge result)." \
+              "" \
+              "Workflow run: ${RUN_URL}")
+          else
+            case "$TESTS_OUTCOME" in
+              success) TEST_LINE="**PR gate: e2e test suite passed** (\`pytest tests/e2e/\`)." ;;
+              *)       TEST_LINE="**PR gate: e2e test suite FAILED** (\`pytest tests/e2e/\`) — do not merge until green. See the workflow run for logs." ;;
+            esac
+            TITLE="Deus upstream sync: merge NousResearch/hermes-agent ${UPSTREAM_BRANCH}"
+            BODY=$(printf '%s\n' \
+              "## Upstream sync — clean merge" \
+              "" \
+              "Automated weekly merge of \`upstream/${UPSTREAM_BRANCH}\` (NousResearch/hermes-agent) into \`${DEFAULT_BRANCH}\`." \
+              "" \
+              "${TEST_LINE}" \
+              "" \
+              "Automerge is not enabled — review and merge manually." \
+              "" \
+              "Workflow run: ${RUN_URL}")
+          fi
+
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          PR_NUMBER=$(curl -sSf "${AUTH[@]}" \
+            "${API}/pulls?state=open&base=${DEFAULT_BRANCH}&head=${OWNER}:${SYNC_BRANCH}" \
+            | jq -r '.[0].number // empty')
+
+          if [ -z "$PR_NUMBER" ]; then
+            PR_NUMBER=$(jq -n --arg t "$TITLE" --arg b "$BODY" \
+                --arg head "$SYNC_BRANCH" --arg base "$DEFAULT_BRANCH" \
+                '{title: $t, body: $b, head: $head, base: $base, maintainer_can_modify: true}' \
+              | curl -sSf "${AUTH[@]}" -X POST -d @- "${API}/pulls" | jq -r .number)
+            echo "Opened PR #${PR_NUMBER}"
+          else
+            jq -n --arg t "$TITLE" --arg b "$BODY" '{title: $t, body: $b}' \
+              | curl -sSf "${AUTH[@]}" -X PATCH -d @- "${API}/pulls/${PR_NUMBER}" > /dev/null
+            echo "Updated PR #${PR_NUMBER}"
+          fi
+
+          # Ensure the label exists (422 = already there, ignore), then apply it.
+          jq -n --arg name "$SYNC_LABEL" \
+              '{name: $name, color: "5319e7", description: "Automated upstream sync PR"}' \
+            | curl -sS "${AUTH[@]}" -X POST -d @- "${API}/labels" > /dev/null || true
+          jq -n --arg l "$SYNC_LABEL" '{labels: [$l]}' \
+            | curl -sSf "${AUTH[@]}" -X POST -d @- "${API}/issues/${PR_NUMBER}/labels" > /dev/null
+
+      - name: Gate — fail the run if the test suite failed
+        if: steps.merge.outputs.status == 'merged' && steps.tests.outcome != 'success'
+        run: |
+          echo "::error::e2e test suite failed on the merged tree — sync PR left open but red."
+          exit 1
